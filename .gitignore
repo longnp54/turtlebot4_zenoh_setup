@@ -1,0 +1,8 @@
+*.deb
+*.log
+*.bak
+__pycache__/
+build/
+install/
+log/
+.vscode/

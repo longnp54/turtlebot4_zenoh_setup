@@ -1,0 +1,15 @@
+[Unit]
+Description=Zenoh Bridge for ROS 2 DDS
+After=network-online.target turtlebot4.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ubuntu
+Environment="CYCLONEDDS_URI=file:///etc/turtlebot4/cyclonedds_rpi.xml"
+ExecStart=/usr/bin/zenoh-bridge-ros2dds -c /etc/turtlebot4/zenoh_rpi.json5
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target
