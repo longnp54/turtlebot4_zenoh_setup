@@ -1,43 +1,57 @@
-# TurtleBot4 Zenoh Setup Guide (Laptop + Multiple Robots)
+# TurtleBot4 Multi-Robot Zenoh Setup Guide
 
-This document is a full end-to-end runbook in English.
-It covers setup from scratch on Laptop (Ubuntu 24.04 + ROS 2 Jazzy), first Wi-Fi connection on fresh robots, automated deployment, daily operation, and troubleshooting.
+End-to-end setup and operation guide for controlling one or multiple **TurtleBot 4** robots from a single **Laptop (Ubuntu 24.04 + ROS 2 Jazzy)** over Wi-Fi using **Eclipse Zenoh** (`zenoh-bridge-ros2dds`).
 
-## Project Structure
+## Architecture Overview
 
-Use this repository layout:
+To prevent DDS multicast storms over Wi-Fi and isolate robot namespaces, DDS traffic is split into two isolated domains bridged by Zenoh over TCP:
+
+```text
+[Laptop: ROS 2 Jazzy] ──(CycloneDDS on lo)──> [Zenoh Peer]
+                                                   │
+                                          Wi-Fi (TCP :7447)
+                                                   │
+[Create 3 Base] <──(CycloneDDS on usb0)── [RPi: Zenoh Router]
+```
+
+## Customization Placeholders (Read Before Starting)
+
+Throughout this guide, replace `<PLACEHOLDER>` values with your own setup parameters:
+
+| Placeholder | Required? | Description & Example |
+| :--- | :--- | :--- |
+| `<WORKSPACE_DIR>` | Optional | Any folder on your Laptop to store this repo (e.g., `~/ros2_ws` or `~/projects`). |
+| `<ROBOT_IP>` | **Required** | IPv4 address of the TurtleBot 4 on your Wi-Fi network (e.g., `192.168.1.101`). |
+| `<ROBOT_NAMESPACE>` | Optional | Unique ROS 2 namespace per robot to avoid topic collisions (e.g., `/robot1`, `/tb4_a`). Required when running multiple robots. |
+| `<WIFI_SSID>` | **Required** | Name of your lab/office Wi-Fi network (e.g., `"My_Lab_WiFi"`). |
+| `<WIFI_PASSWORD>` | Optional | Wi-Fi password. Pass `""` if connecting to an open/passwordless network. |
+| `<STATIC_IP/CIDR>` | Optional | Desired static IP + subnet mask for the robot (e.g., `192.168.1.101/24`). |
+| `<GATEWAY>` | Optional | Default router gateway IP for your Wi-Fi network (e.g., `192.168.1.1`). |
+
+## Repository Structure
 
 ```text
 turtlebot4_zenoh_setup/
 ├── laptop/
-│   ├── cyclonedds_laptop.xml
-│   ├── zenoh_both.json5
-│   └── env.sh
+│   ├── cyclonedds_laptop.xml   # Locks Laptop CycloneDDS to loopback (lo)
+│   ├── zenoh_both.json5        # Laptop Zenoh peer config with robot IP endpoints
+│   └── env.sh                  # Laptop ROS/Zenoh environment variables & 'tb' alias
 └── turtlebot4/
-    ├── cyclonedds_rpi.xml
-    ├── zenoh_rpi.json5
-    ├── setup.bash
-    ├── zenoh-bridge.service
-    ├── setup_network.sh
-    └── deploy_robot.sh
+    ├── cyclonedds_rpi.xml      # Locks Robot CycloneDDS to Create 3 USB link (usb0)
+    ├── zenoh_rpi.json5         # Robot Zenoh router config (listens on port 7447)
+    ├── setup.bash              # Robot ROS 2 environment and namespace exports
+    ├── zenoh-bridge.service    # Systemd service for auto-starting Zenoh on boot
+    ├── setup_network.sh        # Helper script to configure Static Wi-Fi & port 7447
+    └── deploy_robot.sh         # Automated deployment script run from Laptop
 ```
 
-What each file is for:
-- laptop/cyclonedds_laptop.xml: lock laptop CycloneDDS to loopback (lo)
-- laptop/zenoh_both.json5: laptop zenoh peer config with robot endpoints
-- laptop/env.sh: laptop ROS and Zenoh runtime env, includes alias tb
-- turtlebot4/cyclonedds_rpi.xml: lock robot CycloneDDS to usb0 (Create 3 link)
-- turtlebot4/zenoh_rpi.json5: robot zenoh router config on port 7447
-- turtlebot4/setup.bash: robot ROS environment exports
-- turtlebot4/zenoh-bridge.service: systemd service for zenoh-bridge-ros2dds
-- turtlebot4/setup_network.sh: robot network setup helper
-- turtlebot4/deploy_robot.sh: laptop-side automated deploy script
+---
 
-## Phase 1: Laptop Installation and Configuration (From Zero)
+## Phase 1: Laptop Setup (Ubuntu 24.04 + ROS 2 Jazzy)
 
-Perform all steps below on Laptop (Ubuntu 24.04 + ROS 2 Jazzy).
+Perform all steps below on your **Laptop**.
 
-### Step 1: Install CycloneDDS and required ROS 2 tools
+### 1. Install ROS 2 Dependencies
 
 ```bash
 sudo apt update
@@ -48,132 +62,171 @@ sudo apt install -y \
   git curl
 ```
 
-### Step 2: Install zenoh-bridge-ros2dds on Laptop and prepare package for Robot
+### 2. Install `zenoh-bridge-ros2dds` (v1.9.0)
 
-1. Download release artifacts from the official Eclipse Zenoh ROS2DDS release page (version 1.9.0):
-- Laptop package (Intel/AMD): zenoh-bridge-ros2dds_1.9.0_amd64.deb
-- Robot package (Raspberry Pi ARM64): zenoh-bridge-ros2dds_1.9.0_arm64.deb
+1. Download both `.deb` packages from the [Eclipse Zenoh ROS2DDS Releases](https://github.com/eclipse-zenoh/zenoh-plugin-ros2dds/releases) page into `~/Downloads`:
+   - **Laptop (Intel/AMD):** `zenoh-bridge-ros2dds_1.9.0_amd64.deb`
+   - **Robot (Raspberry Pi ARM64):** `zenoh-bridge-ros2dds_1.9.0_arm64.deb`
 
-2. Install amd64 on Laptop and keep arm64 in home directory for deployment scripts:
+2. Install the `amd64` package on your Laptop and stage the `arm64` package in your home directory (`~/`) for automated robot deployment:
 
 ```bash
 sudo dpkg -i ~/Downloads/zenoh-bridge-ros2dds_1.9.0_amd64.deb || sudo apt-get install -f -y
-cp ~/Downloads/zenoh-bridge-ros2dds_1.9.0_arm64.deb ~/zenoh-bridge-ros2dds_1.9.0_arm64.deb
+cp ~/Downloads/zenoh-bridge-ros2dds_1.9.0_arm64.deb ~/
+
+# Verify installation
 zenoh-bridge-ros2dds --version
 ```
 
-### Step 3: Clone the project and set executable permissions
-
-You can use your own workspace path. Example:
+### 3. Clone Repository & Configure Shell Environment
 
 ```bash
-mkdir -p ~/Documents/ROS/Projects
-cd ~/Documents/ROS/Projects
+# Replace <WORKSPACE_DIR> with your preferred folder (Example: ~/ros2_ws)
+mkdir -p <WORKSPACE_DIR>
+cd <WORKSPACE_DIR>
 
-git clone <YOUR_REPO_URL> turtlebot4_zenoh_setup
+git clone [https://github.com/longnp54/turtlebot4_zenoh_setup.git](https://github.com/longnp54/turtlebot4_zenoh_setup.git)
 cd turtlebot4_zenoh_setup
 
 chmod +x turtlebot4/deploy_robot.sh turtlebot4/setup_network.sh
 ```
 
-### Step 4: Load laptop environment and tb alias from bashrc
+Add ROS 2 and Laptop Zenoh environment variables to `~/.bashrc`:
 
 ```bash
 cp ~/.bashrc ~/.bashrc.bak
 
 grep -q "/opt/ros/jazzy/setup.bash" ~/.bashrc || echo "source /opt/ros/jazzy/setup.bash" >> ~/.bashrc
-grep -q "turtlebot4_zenoh_setup/laptop/env.sh" ~/.bashrc || echo 'source "'$PWD'/laptop/env.sh"' >> ~/.bashrc
+grep -q "turtlebot4_zenoh_setup/laptop/env.sh" ~/.bashrc || echo "source $PWD/laptop/env.sh" >> ~/.bashrc
 
 source ~/.bashrc
 ```
 
-Quick check:
+Verify that `CYCLONEDDS_URI` points to `laptop/cyclonedds_laptop.xml`:
 
 ```bash
 echo "$CYCLONEDDS_URI"
 ```
 
-If the output points to laptop/cyclonedds_laptop.xml, laptop foundation is ready.
+---
 
-## Phase 2: Initial Wi-Fi Connection on Fresh Robot (Raspberry Pi)
+## Phase 2: TurtleBot 4 Network Setup (Wi-Fi, Static IP & Port 7447)
 
-If robot is new/offline, connect robot to the same Wi-Fi network as Laptop first.
+Perform these steps on **each TurtleBot 4 (Raspberry Pi)** so it is reachable on the same Wi-Fi network as your Laptop and allows Zenoh traffic on TCP port `7447`.
 
-### Step 1: Access Raspberry Pi terminal
+### 1. Access the Raspberry Pi Terminal
 
-Option A (Direct access):
-- Connect HDMI display and USB keyboard to Raspberry Pi
-- Login credentials (default):
-  - User: ubuntu
-  - Password: turtlebot4
+- **Option A (Direct):** Connect an HDMI monitor and USB keyboard to the Raspberry Pi.
+- **Option B (AP Hotspot):** Connect your Laptop to the robot's default hotspot (`Turtlebot4`) and SSH in:
+  ```bash
+  ssh ubuntu@192.168.185.3
+  ```
+*(Default credentials — User: `ubuntu` | Password: `turtlebot4`)*
 
-Option B (Default robot hotspot):
-- Connect Laptop to robot hotspot (usually Turtlebot4, password turtlebot4)
-- SSH into Pi:
+### 2. Connect Robot to Wi-Fi
 
-```bash
-ssh ubuntu@192.168.185.3
-```
+Choose **either** a quick DHCP connection or a Static IP setup:
 
-### Step 2: Connect Pi to Lab/Office Wi-Fi and get IP address
+- **Option 2A — Quick DHCP Connection (Dynamic IP):**
+  ```bash
+  sudo nmcli dev wifi connect "<WIFI_SSID>" password "<WIFI_PASSWORD>"
+  ip -4 -br addr show wlan0
+  ```
 
-On robot terminal:
+- **Option 2B — Static IP + Firewall Setup (Recommended for Multi-Robot):**  
+  Transfer `turtlebot4/setup_network.sh` to the robot (or use `/usr/local/sbin/tb4_setup_network.sh` after Phase 3) and run:
+  ```bash
+  chmod +x setup_network.sh
 
-```bash
-sudo nmcli dev wifi connect "<WIFI_SSID>" password "<WIFI_PASSWORD>"
-ip -4 -br addr show wlan0
-```
+  # Syntax: ./setup_network.sh "<WIFI_SSID>" "<WIFI_PASSWORD>" "<STATIC_IP/CIDR>" "<GATEWAY>"
+  # Example (Wi-Fi with password):
+  ./setup_network.sh "My_Lab_WiFi" "secret123" "192.168.1.101/24" "192.168.1.1"
 
-Record robot IP (example: 10.11.57.174 and 10.11.57.175).
+  # Example (Open Wi-Fi without password):
+  ./setup_network.sh "My_Open_WiFi" "" "192.168.1.101/24" "192.168.1.1"
+  ```
 
-### Step 3: Verify internal Create 3 link
+### 3. Verify Create 3 USB Connection
 
-On robot terminal:
+Confirm that the Raspberry Pi (`192.168.186.3`) can communicate with the Create 3 base (`192.168.186.2`) over `usb0`:
 
 ```bash
 ping -c 3 192.168.186.2
 ```
 
-Expected: successful replies from 192.168.186.2.
+---
 
-## Phase 3: Automated Deployment from Laptop to Each Robot
+## Phase 3: TurtleBot 4 Zenoh & CycloneDDS Setup
 
-Return to Laptop terminal (same Wi-Fi network as robots).
+Install and configure `zenoh-bridge-ros2dds` (router mode on port `7447`) and CycloneDDS (`usb0` isolation) on **each TurtleBot 4**. Choose **Option A** (recommended) or **Option B**.
 
-### Step 1: Run deploy_robot.sh per robot
+### Option A: Automated Deployment from Laptop (Recommended)
+
+From your **Laptop terminal** (on the same Wi-Fi network as the robots), run `deploy_robot.sh` once per robot with its IP and unique namespace:
 
 ```bash
-cd ~/Documents/ROS/Projects/turtlebot4_zenoh_setup
+cd <WORKSPACE_DIR>/turtlebot4_zenoh_setup
 
-# Deploy for Robot 4 namespace
-./turtlebot4/deploy_robot.sh <IP_ROBOT4> /robot4
-
-# Deploy for Robot 5 namespace
-./turtlebot4/deploy_robot.sh <IP_ROBOT5> /robot5
+# Syntax: ./turtlebot4/deploy_robot.sh <ROBOT_IP> <ROBOT_NAMESPACE>
+# Example for multiple robots:
+./turtlebot4/deploy_robot.sh 192.168.1.101 /robot1
+./turtlebot4/deploy_robot.sh 192.168.1.102 /robot2
 ```
 
-If prompted for SSH password, enter robot password (default: turtlebot4 unless changed).
+*(Enter the robot's SSH password when prompted — default is `turtlebot4`.)*
 
-What deploy script does on each robot:
-1. Uploads robot-side config files
-2. Installs ~/zenoh-bridge-ros2dds_1.9.0_arm64.deb if zenoh bridge is missing
-3. Installs /etc/turtlebot4/cyclonedds_rpi.xml (DDS pinned to usb0)
-4. Installs /etc/turtlebot4/setup.bash with selected namespace
-5. Installs /etc/turtlebot4/zenoh_rpi.json5 (router mode on port 7447)
-6. Installs /etc/systemd/system/zenoh-bridge.service
-7. Installs /usr/local/sbin/tb4_setup_network.sh
-8. Reloads systemd, restarts turtlebot4.service, enables zenoh-bridge.service
-9. Verifies service status and port 7447 listening
+**What `deploy_robot.sh` automates on each robot:**
+1. Copies and installs `~/zenoh-bridge-ros2dds_1.9.0_arm64.deb` on the Raspberry Pi.
+2. Installs `/etc/turtlebot4/cyclonedds_rpi.xml` (pins CycloneDDS strictly to `usb0`).
+3. Installs `/etc/turtlebot4/setup.bash` with your chosen `<ROBOT_NAMESPACE>`.
+4. Installs `/etc/turtlebot4/zenoh_rpi.json5` (Zenoh router listening on `tcp/0.0.0.0:7447`).
+5. Installs `/usr/local/sbin/tb4_setup_network.sh` for future network updates.
+6. Enables and starts `/etc/systemd/system/zenoh-bridge.service`, then restarts `turtlebot4.service`.
 
-### Step 2: Update robot IPs in laptop zenoh config
+### Option B: Manual Setup Directly on TurtleBot 4 (Raspberry Pi)
 
-Edit:
+If you prefer to configure the robot directly on the Raspberry Pi without `deploy_robot.sh`:
+
+1. **Copy `zenoh-bridge-ros2dds_1.9.0_arm64.deb` and the `turtlebot4/` directory** onto the Raspberry Pi (e.g., into `~/turtlebot4/`).
+2. **Install the Zenoh bridge package:**
+   ```bash
+   sudo dpkg -i ~/zenoh-bridge-ros2dds_1.9.0_arm64.deb || sudo apt-get install -f -y
+   zenoh-bridge-ros2dds --version
+   ```
+3. **Install configuration files & set `<ROBOT_NAMESPACE>`** (replace `/robot1` with your desired namespace):
+   ```bash
+   sudo mkdir -p /etc/turtlebot4
+   sudo cp ~/turtlebot4/cyclonedds_rpi.xml /etc/turtlebot4/cyclonedds_rpi.xml
+   sudo cp ~/turtlebot4/zenoh_rpi.json5 /etc/turtlebot4/zenoh_rpi.json5
+   sudo cp ~/turtlebot4/setup.bash /etc/turtlebot4/setup.bash
+
+   # Replace <ROBOT_NAMESPACE> (Example: /robot1)
+   sudo sed -i 's|ROBOT_NAMESPACE=.*|ROBOT_NAMESPACE="<ROBOT_NAMESPACE>"|g' /etc/turtlebot4/setup.bash
+   ```
+4. **Enable and start the Zenoh systemd service:**
+   ```bash
+   sudo cp ~/turtlebot4/zenoh-bridge.service /etc/systemd/system/zenoh-bridge.service
+   sudo systemctl daemon-reload
+   sudo systemctl enable --now zenoh-bridge.service
+   sudo systemctl restart turtlebot4.service
+   ```
+
+### 1. Verify Zenoh on Each Robot
+
+Check that `zenoh-bridge.service` is active and listening on TCP port `7447`:
+
+```bash
+systemctl is-active zenoh-bridge.service
+ss -tlnp | grep 7447
+```
+
+### 2. Register Robot IPs on the Laptop
+
+On your **Laptop**, edit `laptop/zenoh_both.json5` and add `"tcp/<ROBOT_IP>:7447"` under `connect.endpoints` for every robot you want to connect:
 
 ```bash
 nano laptop/zenoh_both.json5
 ```
-
-Ensure endpoints match real robot IPs:
 
 ```json5
 {
@@ -183,8 +236,8 @@ Ensure endpoints match real robot IPs:
   },
   connect: {
     endpoints: [
-      "tcp/10.11.57.174:7447",
-      "tcp/10.11.57.175:7447"
+      "tcp/<ROBOT_1_IP>:7447", // Example: "tcp/192.168.1.101:7447"
+      "tcp/<ROBOT_2_IP>:7447"  // Example: "tcp/192.168.1.102:7447"
     ]
   },
   scouting: {
@@ -200,98 +253,77 @@ Ensure endpoints match real robot IPs:
 }
 ```
 
-## Phase 4: Daily Operation and Validation
+---
 
-### Step 1: Power robots and wait for full hardware readiness
+## Phase 4: Daily Operation & Validation
 
-- Power on one or both TurtleBot4 robots
-- Wait about 45 to 60 seconds
-- Confirm Create 3 is fully up (expected full LED readiness on base)
+### 1. Power On Robots
+Turn on your robots and wait **45–60 seconds** until the Create 3 base chimes and its white LED ring turns solid.
 
-### Step 2: Start bridge on Laptop (Terminal 1)
+### 2. Start the Zenoh Bridge on Laptop (Terminal 1)
 
 ```bash
 tb
 ```
 
-Keep this terminal running.
+Keep this terminal running in the background while operating the robots.
 
-### Step 3: Validate data, teleop, and RViz (Terminal 2)
+### 3. Verify Topics & Control Robots (Terminal 2)
 
-1. List topics:
+1. **List active robot topics:**
+   ```bash
+   ros2 daemon stop
+   ros2 topic list
+   ```
+   Expected output includes topics prefixed with each active `<ROBOT_NAMESPACE>` (e.g., `/robot1/cmd_vel`, `/robot2/cmd_vel`).
 
-```bash
-ros2 daemon stop
-ros2 topic list
-```
+2. **Check topic publish rate:**
+   ```bash
+   # Example: ros2 topic hz /robot1/wheel_status
+   ros2 topic hz <ROBOT_NAMESPACE>/wheel_status
+   ```
 
-Expected: namespaced topics for active robots, for example /robot4/... and /robot5/...
+3. **Teleoperate a specific robot:**
+   ```bash
+   # Example: ros2 run teleop_twist_keyboard teleop_twist_keyboard --ros-args -r cmd_vel:=/robot1/cmd_vel
+   ros2 run teleop_twist_keyboard teleop_twist_keyboard --ros-args -r cmd_vel:=<ROBOT_NAMESPACE>/cmd_vel
+   ```
 
-2. Check wheel status rate:
+4. **Visualize a specific robot in RViz2 (with TF remapping):**
+   ```bash
+   # Example: rviz2 --ros-args -r /tf:=/robot1/tf -r /tf_static:=/robot1/tf_static
+   rviz2 --ros-args -r /tf:=<ROBOT_NAMESPACE>/tf -r /tf_static:=<ROBOT_NAMESPACE>/tf_static
+   ```
 
-```bash
-ros2 topic hz /robot4/wheel_status
-ros2 topic hz /robot5/wheel_status
-```
+---
 
-Expected: stable non-zero frequency (often around ~31 Hz depending on setup).
+## Phase 5: Troubleshooting & Network Updates
 
-3. Teleop each robot:
+### 1. `tb` is running, but no robot topics appear on Laptop
+- Confirm the robot has finished booting (45–60s) and verify its current IP (`ip -4 -br addr show wlan0`).
+- Ensure the IP in `laptop/zenoh_both.json5` matches `<ROBOT_IP>`, then restart `tb`.
+- SSH into the robot and verify services and port `7447`:
+  ```bash
+  systemctl is-active turtlebot4.service
+  systemctl is-active zenoh-bridge.service
+  ss -tlnp | grep 7447
+  ```
 
-```bash
-ros2 run teleop_twist_keyboard teleop_twist_keyboard --ros-args -r cmd_vel:=/robot4/cmd_vel
-ros2 run teleop_twist_keyboard teleop_twist_keyboard --ros-args -r cmd_vel:=/robot5/cmd_vel
-```
-
-4. RViz per robot with tf remap:
-
-```bash
-rviz2 --ros-args -r /tf:=/robot4/tf -r /tf_static:=/robot4/tf_static
-rviz2 --ros-args -r /tf:=/robot5/tf -r /tf_static:=/robot5/tf_static
-```
-
-## Phase 5: Quick Troubleshooting
-
-### Case 1: tb runs but no robot topics on Laptop
-
-1. Check robot hardware is fully initialized
-2. Verify robot current IP address
-3. Update laptop/zenoh_both.json5 with latest IPs
-4. Restart tb command on Laptop
-5. On robot, verify services:
-
-```bash
-systemctl is-active turtlebot4.service
-systemctl is-active zenoh-bridge.service
-ss -tlnp | grep 7447
-```
-
-### Case 2: tb command not found or wrong ROS network behavior
-
+### 2. `tb: command not found` or DDS cross-talk on Laptop
+Reload `~/.bashrc` and verify environment variables:
 ```bash
 source ~/.bashrc
-echo "$RMW_IMPLEMENTATION"
-echo "$CYCLONEDDS_URI"
+echo "$RMW_IMPLEMENTATION"   # Expected: rmw_cyclonedds_cpp
+echo "$CYCLONEDDS_URI"       # Expected: file:///.../laptop/cyclonedds_laptop.xml
 alias tb
 ```
 
-Expected:
-- RMW implementation is rmw_cyclonedds_cpp
-- CYCLONEDDS_URI points to laptop/cyclonedds_laptop.xml
-- alias tb exists
-
-### Case 3: Change robot to another Wi-Fi later
-
-On robot:
+### 3. Switch Wi-Fi or Change Static IP Later
+On the robot terminal, run the installed network helper script:
 
 ```bash
-sudo /usr/local/sbin/tb4_setup_network.sh "<NEW_WIFI_SSID>" "<NEW_WIFI_PASSWORD>" "<NEW_IP_CIDR>" "<NEW_GATEWAY>"
+# Syntax: sudo /usr/local/sbin/tb4_setup_network.sh "<WIFI_SSID>" "<WIFI_PASSWORD>" "<STATIC_IP/CIDR>" "<GATEWAY>"
+sudo /usr/local/sbin/tb4_setup_network.sh "<NEW_WIFI_SSID>" "<NEW_WIFI_PASSWORD>" "<NEW_STATIC_IP/CIDR>" "<NEW_GATEWAY>"
 ```
 
-Then update laptop/zenoh_both.json5 with new robot IP if needed.
-
-## Important Notes
-
-- This repository keeps one shared robot-side config set and deploys namespace per robot run
-- Keep the arm64 package in home directory on Laptop for automatic robot installation
-- Deb artifacts are ignored by .gitignore and should not be committed
+Then update `laptop/zenoh_both.json5` with the new `<ROBOT_IP>` and restart `tb` on your Laptop.
