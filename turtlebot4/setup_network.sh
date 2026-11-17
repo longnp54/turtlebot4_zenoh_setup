@@ -1,21 +1,68 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-SSID="${1:-}"
+# USER INPUT (optional):
+#   Arg 1 = Wi-Fi SSID name
+#   Arg 2 = Wi-Fi password (leave empty for open network)
+#   Arg 3 = Static IPv4 in CIDR format for wlan0
+#   Arg 4 = Default gateway
+# Example:
+#   ./setup_network.sh "Office-WiFi" "my_password" "10.11.57.175/20" "10.11.48.1"
+SSID="${1:-UET-Wifi-Office-Free 5Ghz}"
 PASS="${2:-}"
+WLAN_IP="${3:-10.11.57.175/20}"
+WLAN_GW="${4:-10.11.48.1}"
 
 echo "[INFO] Starting network setup on Raspberry Pi"
 
-if [[ -n "$SSID" && -n "$PASS" ]]; then
-  if command -v nmcli >/dev/null 2>&1; then
-    echo "[INFO] Connecting wlan0 to SSID: $SSID"
-    if ! nmcli dev wifi connect "$SSID" password "$PASS" ifname wlan0; then
-      echo "[WARN] nmcli could not connect wlan0. Check NetworkManager control or use netplan manually."
-    fi
-  else
-    echo "[WARN] nmcli not found. Configure Wi-Fi manually (netplan/NetworkManager)."
-  fi
+echo "[INFO] Writing /etc/netplan/50-wifis.yaml for SSID: $SSID"
+if [[ -n "$PASS" ]]; then
+  sudo bash -c "cat > /etc/netplan/50-wifis.yaml <<EOF
+network:
+  version: 2
+  renderer: NetworkManager
+  wifis:
+    wlan0:
+      dhcp4: false
+      optional: true
+      addresses:
+        - $WLAN_IP
+      routes:
+        - to: default
+          via: $WLAN_GW
+      nameservers:
+        addresses: [8.8.8.8, 1.1.1.1]
+      access-points:
+        \"$SSID\":
+          password: \"$PASS\"
+EOF"
+else
+  sudo bash -c "cat > /etc/netplan/50-wifis.yaml <<EOF
+network:
+  version: 2
+  renderer: NetworkManager
+  wifis:
+    wlan0:
+      dhcp4: false
+      optional: true
+      addresses:
+        - $WLAN_IP
+      routes:
+        - to: default
+          via: $WLAN_GW
+      nameservers:
+        addresses: [8.8.8.8, 1.1.1.1]
+      access-points:
+        \"$SSID\": {}
+EOF"
 fi
+
+echo "[INFO] Securing netplan yaml permissions"
+sudo chown root:root /etc/netplan/*.yaml
+sudo chmod 600 /etc/netplan/*.yaml
+
+echo "[INFO] Applying netplan"
+sudo netplan apply
 
 echo "[INFO] Checking usb0 address"
 if ip -4 -br addr show usb0 | grep -q "192.168.186.3"; then

@@ -1,6 +1,11 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# USER INPUT:
+#   Arg 1 = Robot IP address on your Wi-Fi LAN
+#   Arg 2 = Robot namespace (optional), e.g. /robot, /robot4, /robot5
+# Example:
+#   ./deploy_robot.sh 10.11.57.175 /robot5
 if [[ $# -lt 1 || $# -gt 2 ]]; then
   echo "Usage: $0 <IP_ROBOT> [ROBOT_NAMESPACE]"
   echo "Example: $0 10.11.57.175 /robot5"

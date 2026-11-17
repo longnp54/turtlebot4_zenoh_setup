@@ -1,9 +1,12 @@
 {
+  // USER INPUT: keep this in peer mode for the laptop side.
   mode: "peer",
   listen: {
     endpoints: ["tcp/127.0.0.1:0"]
   },
   connect: {
+    // USER INPUT: replace these IPs with your current robot IP addresses.
+    // Keep :7447 unless you changed the robot-side zenoh port.
     endpoints: [
       "tcp/10.11.57.174:7447",
       "tcp/10.11.57.175:7447"
